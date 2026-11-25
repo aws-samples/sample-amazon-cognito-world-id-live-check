@@ -1,1 +1,29 @@
+sample-amazon-cognito-world-id-live-check: World ID Live Check with Amazon Cognito custom authentication
 Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+This software is licensed under the Apache License, Version 2.0 (the "License").
+See the LICENSE file for the full license text.
+
+Provenance
+----------
+Portions of the Cognito custom authentication trigger logic (the
+Define/Create/Verify auth challenge handlers) are derived from the AWS sample
+"cognito-custom-authentication" (email MFA backend), originally published under
+the MIT-0 (MIT No Attribution) license by Amazon.com, Inc. or its affiliates.
+The derived code has been adapted to replace the emailed one-time code with a
+World ID Live Check: CreateAuthChallenge signs a Relying-Party request (via a
+Node signer that reads the signing key from AWS Secrets Manager),
+VerifyAuthChallengeResponse forwards the returned proof to the World ID verify
+API. Using World ID 4.0 session proofs, the first sign-in binds a World ID
+session to the Cognito account, and later sign-ins must prove that session.
+
+Third-party components
+----------------------
+This reference integrates with World ID (Tools for Humanity). The World ID
+Developer Portal, IDKit SDK, the World ID App, and the World ID verify API are
+third-party services and software governed by their own terms and licenses; they
+are not part of, and not licensed under, this repository. The World ID Live
+Check is an access-gated capability of that third-party service. This
+repository does not redistribute World ID software. The @worldcoin/idkit-core
+package (MIT license) is installed from npm as a dependency of the frontend and
+the RP signer, and remains subject to its upstream license.

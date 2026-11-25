@@ -1,0 +1,11 @@
+{
+  "name": "worldid-rp-signer",
+  "version": "1.0.0",
+  "description": "World ID RP-signature signer Lambda (invoked by the Cognito CreateAuthChallenge trigger).",
+  "type": "module",
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.600.0",
+    "@worldcoin/idkit-core": "^4.6.0"
+  }
+}

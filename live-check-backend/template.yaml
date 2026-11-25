@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cognito Custom Authentication with World ID Live Check.
+
+  After password verification the flow issues a CUSTOM_CHALLENGE that is a World
+  ID Live Check (IDKit). CreateAuthChallenge signs an RP request (via a Node
+  signer Lambda that reads the RP signing key from Secrets Manager) and hands the
+  request context to the browser; the browser runs IDKit and returns a proof;
+  VerifyAuthChallengeResponse forwards the proof to the World verify API. On the
+  first sign-in it enrolls a World ID 4.0 session for the account (with optional
+  enrollment uniqueness); on later sign-ins it requires a proof of that session.
+
+Parameters:
+  WorldIdAppId:
+    Type: String
+    Description: World ID Developer Portal app_id (app_...).
+  WorldIdRpId:
+    Type: String
+    Description: World ID Relying Party id (rp_...).
+  WorldIdAction:
+    Type: String
+    Default: livecheck-signin
+    Description: >
+      World ID 4.0 enrollment action created in the Developer Portal. Used only for
+      the first (enrollment) uniqueness request; returning users prove their saved
+      session, which carries no action.
+  EnforceUniqueEnrollment:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >
+      "true" (World ID 4.0 guidance): reject an enrollment whose nullifier was
+      already used, so one person can enroll only one account (one-to-one).
+      "false": allow the same person to enroll multiple accounts (one-to-many).
+  WorldIdEnvironment:
+    Type: String
+    Default: staging
+    AllowedValues:
+      - staging
+      - production
+      - sandbox
+    Description: >
+      Must match the action's environment and the client IDKit env. Use "sandbox"
+      to run the gated Live Check sandbox app; the verify endpoint is the same
+      production host in all cases.
+  RpSigningKeySecretArn:
+    Type: String
+    Description: >
+      ARN of the Secrets Manager secret holding the RP signing key (hex, or JSON
+      {"signing_key":"0x.."}). Create this out of band; never commit the key.
+
+Globals:
+  Function:
+    Timeout: 10
+    # Enable AWS X-Ray active tracing on all functions for observability.
+    Tracing: Active
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UsernameAttributes:
+        - email
+      AdminCreateUserConfig:
+        # Compliance: self-registration is disabled at pool creation. Only an
+        # admin can create users (admin-create-user); public Auth.signUp is
+        # rejected with "SignUp is not permitted for this user pool".
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      # The CUSTOM_CHALLENGE is a World ID Live Check completed out-of-band in
+      # the World ID App (scan QR -> install/enroll -> selfie -> proof). That easily
+      # exceeds the default 3-minute custom-auth session, which made the proof
+      # submission fail with NotAuthorizedException. 15 minutes (the Cognito max,
+      # and IDKit's own pollUntilCompletion default) gives the human enough time.
+      AuthSessionValidity: 15
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_CUSTOM_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # Customer-managed KMS key encrypting the World ID tables (CKV_AWS_119).
+  # Rotation is on (CKV_AWS_7). The key policy gives the account root admin and
+  # lets the trigger function use the key for DynamoDB SSE.
+  NullifierTableKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "CMK for ${AWS::StackName} World ID tables encryption"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRootAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+
+  NullifierTableKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-worldid"
+      TargetKeyId: !Ref NullifierTableKey
+
+  # Nullifier claims, keyed with a prefix:
+  #   "enroll#<nullifier>"          enrollment uniqueness (permanent)
+  #   "session#<session_nullifier>" per-proof replay guard (expires via TTL)
+  NullifierTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: nullifier
+          AttributeType: S
+      KeySchema:
+        - AttributeName: nullifier
+          KeyType: HASH
+      # Point-in-time recovery (CKV_AWS_28): continuous backups for restore.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      # Encrypt at rest with the customer-managed CMK above (CKV_AWS_119).
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref NullifierTableKey
+      # Session replay-guard items carry an expires_at epoch; enrollment items don't.
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  # One item per enrolled Cognito user: sub -> World ID session_id (+ enrollment
+  # nullifier). Written once at enrollment with a conditional put; never silently
+  # replaced (World ID treats re-binding a session as an account-security operation).
+  AccountTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sub
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sub
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref NullifierTableKey
+
+  # Node signer: produces the RP signature (Keccak-256 + secp256k1) using the
+  # World ID signing helper. Isolated from the Python triggers so we don't need
+  # crypto libs in the Python runtime.
+  RpSignerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/rp_signer/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          RP_SIGNING_KEY_SECRET_ARN: !Ref RpSigningKeySecretArn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref RpSigningKeySecretArn
+
+  LiveCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/triggers/
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          WORLDID_APP_ID: !Ref WorldIdAppId
+          WORLDID_RP_ID: !Ref WorldIdRpId
+          WORLDID_ACTION: !Ref WorldIdAction
+          WORLDID_ENVIRONMENT: !Ref WorldIdEnvironment
+          RP_SIGNER_FUNCTION_ARN: !GetAtt RpSignerFunction.Arn
+          NULLIFIER_TABLE: !Ref NullifierTable
+          ACCOUNT_TABLE: !Ref AccountTable
+          ENFORCE_UNIQUE_ENROLLMENT: !Ref EnforceUniqueEnrollment
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt RpSignerFunction.Arn
+        # Least privilege: conditional puts only (TransactWriteItems is authorized
+        # per item as PutItem), plus a single-item read of the caller's account.
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:PutItem
+              Resource: !GetAtt NullifierTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+              Resource: !GetAtt AccountTable.Arn
+        # Use the customer-managed CMK for the encrypted World ID tables.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+                - kms:DescribeKey
+              Resource: !GetAtt NullifierTableKey.Arn
+      Events:
+        CognitoTrigger:
+          Type: Cognito
+          Properties:
+            Trigger:
+              - CreateAuthChallenge
+              - DefineAuthChallenge
+              - VerifyAuthChallengeResponse
+            UserPool: !Ref UserPool
+
+  # Explicit log groups with 30-day retention. Without these, Lambda auto-creates
+  # log groups that never expire. Referencing ${Function} resolves to the
+  # generated function name, so no names are hardcoded.
+  LiveCheckFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LiveCheckFunction}"
+      RetentionInDays: 30
+
+  RpSignerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${RpSignerFunction}"
+      RetentionInDays: 30
+
+Outputs:
+  CognitoUserPoolId:
+    Description: "Cognito UserPool ID"
+    Value: !Ref UserPool
+  CognitoUserPoolClientId:
+    Description: "Cognito UserPool Client ID"
+    Value: !Ref UserPoolClient
+  NullifierTableName:
+    Description: "DynamoDB table holding World ID enrollment and session nullifier claims"
+    Value: !Ref NullifierTable
+  AccountTableName:
+    Description: "DynamoDB table mapping each Cognito user (sub) to its World ID session_id"
+    Value: !Ref AccountTable

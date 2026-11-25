@@ -1,0 +1,85 @@
+@startuml
+title World ID Live Check (World ID 4.0) - Cognito Custom Auth Sequence
+participant Client as "Browser\n(React SPA + IDKit)"
+participant Cognito
+participant Lambda as "LiveCheckFunction\n(Python triggers)"
+participant Signer as "RpSignerFunction\n(Node)"
+participant Secrets as "Secrets Manager"
+participant World as "World ID App +\nWorld verify API"
+database Accounts as "DynamoDB\nAccountTable"
+database Nullifiers as "DynamoDB\nNullifierTable"
+
+== Password step (SRP) ==
+Client -> Cognito: <b>InitiateAuth</b>\n  - AuthFlow: CUSTOM_AUTH\n  - ChallengeName: SRP_A
+Cognito -> Lambda: <b>DefineAuthChallenge</b>\n  session: [SRP_A]
+Cognito <- Lambda: Next ChallengeName: PASSWORD_VERIFIER
+Client <- Cognito: Next ChallengeName: PASSWORD_VERIFIER
+Client -> Cognito: <b>RespondToAuthChallenge</b>\n  - PASSWORD_VERIFIER\n  - <SRP password proof> (+ Session)
+Cognito -> Cognito: Verify password
+Cognito -> Lambda: <b>DefineAuthChallenge</b>\n  session: [SRP_A, PASSWORD_VERIFIER]
+Cognito <- Lambda: Next ChallengeName: CUSTOM_CHALLENGE
+note right of Lambda
+  Strict order. An empty session (no password),
+  a failed step, or any other sequence fails.
+end note
+
+== World ID Live Check (custom challenge) ==
+Cognito -> Lambda: <b>CreateAuthChallenge</b>\n  - CUSTOM_CHALLENGE
+Lambda -> Accounts: GetItem(sub)  (consistent read)
+alt no saved session -> enroll
+  alt EnforceUniqueEnrollment = true (one-to-one)
+    Lambda -> Signer: invoke { action }
+  else EnforceUniqueEnrollment = false (one-to-many)
+    Lambda -> Signer: invoke { }  (no action)
+  end
+else saved session_id -> prove
+  Lambda -> Signer: invoke { }  (session proofs carry no action)
+end
+Signer -> Secrets: GetSecretValue (RP signing key)
+Signer -> Signer: signRequest()\n(Keccak-256 + secp256k1)
+Lambda <- Signer: { sig, nonce, created_at, expires_at }
+note right of Lambda
+  publicChallengeParameters (to browser):
+    mode, app_id, rp_id, environment, signed rp_context,
+    + action (one-to-one enroll) or session_id (prove)
+  privateChallengeParameters (backend only):
+    mode, nonce, + unique and action (enroll) or session_id (prove)
+end note
+Client <- Cognito: Next ChallengeName: CUSTOM_CHALLENGE\n  (+ publicChallengeParameters)
+
+alt enroll, one-to-one
+  Client -> Client: IDKit.request({ action, session_id: "create" })
+else enroll, one-to-many
+  Client -> Client: IDKit.createSession({ ... })
+else prove
+  Client -> Client: IDKit.proveSession(session_id, { ... })
+end
+note over Client
+  All three: .constraints(CredentialRequest("selfie")),
+  then render the QR code (connectorURI).
+end note
+Client -> World: user scans QR, completes Live Check
+Client <- World: IDKit result (pollUntilCompletion, up to 14 min)
+
+Client -> Cognito: <b>RespondToAuthChallenge</b>\n  - CUSTOM_CHALLENGE\n  - ChallengeAnswer: <IDKit result JSON>
+Cognito -> Lambda: <b>VerifyAuthChallengeResponse</b>\n  - ChallengeAnswer: <result>
+Lambda -> Lambda: Local checks: protocol 4.0, signed nonce,\nselfie credential, mode-specific action / session_id
+Lambda -> World: POST /api/v4/verify/{rp_id} (result unchanged)\n  Header: browser User-Agent (Cloudflare 1010 otherwise)
+Lambda <- World: { success: true, environment, session_id, ... }
+Lambda -> Lambda: Require environment and session_id to match
+alt enroll
+  Lambda -> Accounts: TransactWriteItems: Put sub -> session_id\n  if attribute_not_exists(sub)
+  Lambda -> Nullifiers: ...same transaction: Put enroll#<nullifier> (one-to-one)\n  or session#<session_nullifier> + TTL (one-to-many)\n  if attribute_not_exists
+else prove
+  Lambda -> Nullifiers: PutItem session#<session_nullifier> + TTL\n  if attribute_not_exists (replay guard)
+end
+note right of Lambda
+  A failed condition rejects the answer:
+  account already enrolled, person already enrolled,
+  or a replayed proof. Any error fails closed.
+end note
+Cognito <- Lambda: answerCorrect: True
+Cognito -> Lambda: <b>DefineAuthChallenge</b>\n  session: [SRP_A, PASSWORD_VERIFIER, CUSTOM_CHALLENGE]
+Cognito <- Lambda: IssueTokens: True
+Client <- Cognito: IdToken\nAccessToken\nRefreshToken
+@enduml
